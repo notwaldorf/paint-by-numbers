@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paint by Numbers</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>Paint <em>by</em> Numbers</h1>
+</header>
+
+<div class="layout">
+
+  <!-- Left panel -->
+  <aside class="panel">
+
+    <div>
+      <div class="section-label">01 — Source image</div>
+      <div class="upload-zone" id="uploadZone">
+        <input type="file" id="fileInput" accept="image/*">
+        <span class="upload-icon">🖼</span>
+        <p><strong>Click or drag</strong> an image here<br>JPG, PNG, GIF, WebP</p>
+        <img class="thumb-preview" id="thumbPreview" alt="">
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">02 — Number of colours</div>
+      <div class="slider-row">
+        <input type="range" id="colourSlider" min="2" max="24" value="8" step="1">
+        <span class="colour-count" id="colourCountDisplay">8</span>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">03 — Smoothing</div>
+      <div class="slider-row">
+        <input type="range" id="smoothSlider" min="0" max="3" value="2" step="1">
+        <span class="smooth-label" id="smoothLabelDisplay">Medium</span>
+      </div>
+      <p class="hint">Simplifies small regions so the result is actually paintable.</p>
+    </div>
+
+    <div>
+      <div class="section-label">04 — Options</div>
+      <div class="options-stack">
+        <label class="option-row">
+          <input type="checkbox" id="optOutlines" checked>
+          Show region outlines
+        </label>
+        <label class="option-row">
+          <input type="checkbox" id="optNumbers" checked>
+          Show numbers on regions
+        </label>
+      </div>
+    </div>
+
+    <button class="btn" id="generateBtn" disabled>Generate →</button>
+
+    <div id="paletteSection" style="display:none">
+      <div class="section-label">05 — Colour palette</div>
+      <div class="palette-list" id="paletteList"></div>
+    </div>
+
+  </aside>
+
+  <!-- Canvas area -->
+  <main class="canvas-area" id="canvasArea">
+
+    <div class="empty-state" id="emptyState">
+      <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="8" y="12" width="48" height="40" rx="1" stroke="currentColor" stroke-width="2"/>
+        <circle cx="22" cy="26" r="5" stroke="currentColor" stroke-width="2"/>
+        <path d="M8 40 L20 30 L32 38 L44 26 L56 36" stroke="currentColor" stroke-width="2"/>
+        <line x1="16" y1="8" x2="16" y2="16" stroke="currentColor" stroke-width="2"/>
+        <line x1="32" y1="8" x2="32" y2="16" stroke="currentColor" stroke-width="2"/>
+        <line x1="48" y1="8" x2="48" y2="16" stroke="currentColor" stroke-width="2"/>
+      </svg>
+      <p>Upload an image to begin</p>
+    </div>
+
+    <div class="progress-bar-wrap" id="progressWrap" style="display:none">
+      <div class="progress-label" id="progressLabel">Processing…</div>
+      <div class="progress-track progress-indeterminate" id="progressTrack">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+    </div>
+
+    <div class="canvas-toolbar" id="toolbar" style="display:none">
+      <!-- Painted / unpainted toggle -->
+      <label class="toggle-pill" title="Toggle between painted preview and blank paint-by-numbers template">
+        <input type="checkbox" id="previewToggle" checked>
+        <span class="pill-track">
+          <span class="pill-thumb"></span>
+        </span>
+        <span class="pill-labels">
+          <span class="pill-option" data-state="off">Blank</span>
+          <span class="pill-sep">/</span>
+          <span class="pill-option" data-state="on">Painted</span>
+        </span>
+      </label>
+      <div class="toolbar-spacer"></div>
+      <button class="btn-sm" id="downloadBtn">↓ Download PNG</button>
+    </div>
+
+    <div class="output-wrapper" id="outputWrapper" style="display:none">
+      <canvas id="outputCanvas"></canvas>
+    </div>
+
+  </main>
+</div>
+
+<!-- Hidden working canvas -->
+<canvas id="workCanvas" style="display:none"></canvas>
+
+<script src="app.js"></script>
+</body>
+</html>
