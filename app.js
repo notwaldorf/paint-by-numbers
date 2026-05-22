@@ -29,6 +29,8 @@ const workCanvas    = document.getElementById('workCanvas');
 const downloadBtn   = document.getElementById('downloadBtn');
 const optOutlines   = document.getElementById('optOutlines');
 const optNumbers    = document.getElementById('optNumbers');
+const optSpatialMerge = document.getElementById('optSpatialMerge');
+const optHueAnchors = document.getElementById('optHueAnchors');
 const previewToggle = document.getElementById('previewToggle');
 
 // ─── Upload handling ─────────────────────────────────────────────────────────
@@ -138,14 +140,21 @@ async function runPaintByNumbers() {
   // Step 2: K-means in LAB, with extremes reserved
   setProgress(null, 'Running k-means…');
   await delay(30);
-  const { centroids: rawCentroids, sizes, frozenCount } = await kMeansLab(labPixels, k);
+  const anchorMode = optHueAnchors.checked ? 'hue' : 'extremes';
+  const { centroids: rawCentroids, sizes, frozenCount } = await kMeansLab(labPixels, k, anchorMode);
 
   // Step 2b: Merge perceptually-near-duplicate centroids. K-means happily
   // produces several greens within a few ΔE of each other in leafy images;
   // for someone actually painting this, they'd mix the same paint. So we
   // collapse them. The slider value becomes a MAX, not an exact count.
-  const MERGE_THRESHOLD = 15;   // Hue-weighted LAB distance — "painter same".
+  //
+  // This runs unconditionally — even when spatial merge is enabled later.
+  // The colour-only merge acts as a safety floor that preserves frozen
+  // extremes and kills obvious duplicates; spatial merge then refines
+  // further by collapsing spatially-distant survivors. Without this step,
+  // spatial merge can be too aggressive at low k.
   const MIN_K = Math.max(4, Math.ceil(k / 3));
+  const MERGE_THRESHOLD = 15;   // Hue-weighted LAB distance — "painter same".
   const labPalette = mergeNearbyCentroids(rawCentroids, sizes, frozenCount, MERGE_THRESHOLD, MIN_K);
   if (labPalette.length < rawCentroids.length) {
     console.log(`Merged ${rawCentroids.length} → ${labPalette.length} palette entries`);
@@ -176,10 +185,14 @@ async function runPaintByNumbers() {
   const fullData = wctx.getImageData(0, 0, W, H).data;
 
   let indexMap = new Uint8Array(W * H);
+  // When hue-anchor mode is on, use hue-weighted nearest so e.g. a tiny bright
+  // cyan leaf-fleck is assigned to the cyan palette colour rather than to a
+  // mid-lightness green that happens to be closer in straight LAB distance.
+  const assignFn = optHueAnchors.checked ? nearestPaletteLabHueWeighted : nearestPaletteLab;
   for (let i = 0; i < W * H; i++) {
     if (fullData[i*4 + 3] < 128) { indexMap[i] = 255; continue; }
     const lab = rgbToLab(fullData[i*4], fullData[i*4+1], fullData[i*4+2]);
-    indexMap[i] = nearestPaletteLab(lab, labPalette);
+    indexMap[i] = assignFn(lab, labPalette);
   }
 
   // Step 4: Clean up noise — mode filter + small-region removal
@@ -197,8 +210,28 @@ async function runPaintByNumbers() {
     indexMap = removeSmallRegions(indexMap, W, H, minRegionSize);
   }
 
+  // Step 5 (optional, experimental): Spatial-aware palette merging.
+  // Runs AFTER region cleanup so the adjacency graph isn't polluted by noise.
+  // Collapses palette entries that are perceptually similar AND don't touch
+  // each other in the image — these are "wasted" palette slots that just
+  // re-paint distant areas with marginally-different paint.
+  let finalPalette = palette;
+  let finalLabPalette = labPalette;
+  if (optSpatialMerge.checked) {
+    setProgress(null, 'Spatial merging…');
+    await delay(30);
+    const before = labPalette.length;
+    const merged = spatialMergePalette(indexMap, W, H, labPalette, frozenCount, MIN_K);
+    indexMap = merged.indexMap;
+    finalLabPalette = merged.labPalette;
+    finalPalette = finalLabPalette.map(c => labToRgb(c[0], c[1], c[2]));
+    if (finalLabPalette.length < before) {
+      console.log(`Spatial merge: ${before} → ${finalLabPalette.length} palette entries`);
+    }
+  }
+
   // Cache state for toggle
-  currentPalette = palette;
+  currentPalette = finalPalette;
   currentIndexMap = indexMap;
   currentWidth = W;
   currentHeight = H;
@@ -210,7 +243,7 @@ async function runPaintByNumbers() {
   redrawOutput();
 
   // Palette UI
-  renderPalette(palette);
+  renderPalette(finalPalette);
 
   // Reveal
   progressWrap.style.display = 'none';
@@ -273,30 +306,23 @@ function redrawOutput() {
 }
 
 // ─── K-means in LAB, with extremes reserved ─────────────────────────────────
-// Operates entirely in LAB so distances are perceptual. The brightest and
-// darkest pixels (by L*) get their own dedicated, FROZEN centroids — they
-// are assigned during the E-step but never updated during the M-step. This
-// guarantees the palette preserves true highlights and shadows instead of
-// letting k-means drag them toward the colour mass.
-function kMeansLab(pixels, k) {
+// Operates entirely in LAB so distances are perceptual. Selected pixels get
+// dedicated, FROZEN centroids — they are assigned during the E-step but never
+// updated during the M-step. This guarantees the palette preserves chosen
+// anchors instead of letting k-means drag them toward the colour mass.
+//
+// Two anchor modes:
+//   'extremes' (default): reserve brightest + darkest. 2 frozen centroids.
+//   'hue':                reserve brightest-cool + darkest + warmest +
+//                         neutral-mid. 4 frozen centroids. Designed for
+//                         very low k where k-means alone fails to find
+//                         distinct "role" colours.
+function kMeansLab(pixels, k, anchorMode) {
   return new Promise(resolve => {
-    // Decide how many centroids to reserve for extremes.
-    // For very small palettes (k <= 3), reserve none — we can't spare them.
-    // For k >= 4, reserve 1 bright + 1 dark = 2 frozen centroids.
-    const reserveExtremes = k >= 4;
-    const frozenCount = reserveExtremes ? 2 : 0;
-    const movingCount = k - frozenCount;
-
-    const frozen = [];
-    if (reserveExtremes) {
-      // Sample brightest ~0.5% and darkest ~0.5% by L*, then average each
-      // group to a single centroid. Averaging (rather than picking one pixel)
-      // gives a stable representative even if there's noise.
-      const sorted = pixels.slice().sort((a, b) => a[0] - b[0]);
-      const pct = Math.max(1, Math.floor(sorted.length * 0.005));
-      frozen.push(averageLab(sorted.slice(0, pct)));            // darkest
-      frozen.push(averageLab(sorted.slice(sorted.length - pct))); // brightest
-    }
+    anchorMode = anchorMode || 'extremes';
+    const frozen = buildAnchors(pixels, k, anchorMode);
+    const frozenCount = frozen.length;
+    const movingCount = Math.max(0, k - frozenCount);
 
     // k-means++ init for the moving centroids, biased AWAY from the frozen
     // ones (so we don't waste a moving centroid right next to a frozen one).
@@ -378,6 +404,85 @@ function averageLab(arr) {
   let l = 0, a = 0, b = 0;
   for (const p of arr) { l += p[0]; a += p[1]; b += p[2]; }
   return [l / arr.length, a / arr.length, b / arr.length];
+}
+
+// ─── Anchor selection for k-means ───────────────────────────────────────────
+// Pick a small number of FROZEN centroids from the source pixels that
+// represent specific perceptual roles. K-means then fills the remaining
+// slots with whatever it likes.
+//
+// 'extremes' mode: anchors at darkest + brightest. The default. Designed for
+//   high-k palettes where the main risk is k-means averaging away highlights
+//   and shadows.
+//
+// 'hue' mode: anchors at darkest + brightest-cool + warmest + neutral-mid.
+//   Designed for very low k (k=4 in particular), where k-means alone can't
+//   find distinct "role" colours. At k=4 ALL centroids are anchors. At higher
+//   k the remaining moving centroids fill in.
+//
+// Anchor selection uses averages of pixel sub-sets rather than single pixels,
+// so noise/JPEG artefacts don't pick weird outliers.
+function buildAnchors(pixels, k, mode) {
+  if (k < 2) return []; // No room for anchors.
+
+  // Helper: sample lowest-N percent by some key function, return average.
+  function pickPct(key, lowOrHigh, pct, filterFn) {
+    const filtered = filterFn ? pixels.filter(filterFn) : pixels;
+    if (filtered.length === 0) return null;
+    const sorted = filtered.slice().sort((a, b) => key(a) - key(b));
+    const count = Math.max(1, Math.floor(sorted.length * pct));
+    const slice = lowOrHigh === 'low'
+      ? sorted.slice(0, count)
+      : sorted.slice(sorted.length - count);
+    return averageLab(slice);
+  }
+
+  if (mode === 'extremes') {
+    if (k < 4) return []; // Same threshold as before — skip if too few slots.
+    const anchors = [];
+    const dark = pickPct(p => p[0], 'low', 0.005);
+    const bright = pickPct(p => p[0], 'high', 0.005);
+    if (dark) anchors.push(dark);
+    if (bright) anchors.push(bright);
+    return anchors;
+  }
+
+  if (mode === 'hue') {
+    // Need at least 2 slots — pick darkest + brightest; with more, add hue.
+    // At k=4+, full set of 4 anchors. At k=2 or 3, fall back to a subset.
+    const anchors = [];
+
+    // 1. Darkest 0.5% — frozen shadow.
+    anchors.push(pickPct(p => p[0], 'low', 0.005));
+
+    if (k >= 3) {
+      // 2. Brightest 1% of *cool-leaning* pixels (b* < 0). If no cool pixels
+      //    exist (warm-only image), fall back to plain brightest.
+      const coolBright = pickPct(p => p[0], 'high', 0.01, p => p[2] < 0);
+      anchors.push(coolBright || pickPct(p => p[0], 'high', 0.005));
+    }
+
+    if (k >= 4) {
+      // 3. Warmest pixels by b* (yellow-positive axis). Use a moderately
+      //    inclusive percentile (top 10%) and average, so the anchor lands
+      //    near where the warm cluster is densest, not on a saturated outlier.
+      anchors.push(pickPct(p => p[2], 'high', 0.10));
+
+      // 4. Neutral mid: pixels with low chroma (|a|+|b| small) in the middle
+      //    third of lightness. This catches grey leaves / bark / mid tones.
+      const neutralFilter = p => {
+        const chroma = Math.abs(p[1]) + Math.abs(p[2]);
+        return chroma < 20 && p[0] > 25 && p[0] < 75;
+      };
+      const neutral = pickPct(p => p[0], 'high', 1.0, neutralFilter);
+      // If no neutral pixels exist (very saturated image), skip this anchor.
+      if (neutral) anchors.push(neutral);
+    }
+
+    return anchors.filter(a => a); // Drop nulls.
+  }
+
+  return [];
 }
 
 // ─── Merge near-duplicate palette entries ────────────────────────────────────
@@ -478,6 +583,24 @@ function nearestPaletteLab(lab, palette) {
     const dl = lab[0] - palette[i][0];
     const da = lab[1] - palette[i][1];
     const db = lab[2] - palette[i][2];
+    const d = dl*dl + da*da + db*db;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+// Hue-weighted variant: chroma differences count 3x more than lightness in
+// squared distance (W_L=0.5, W_C=1.5 → squared weights 0.25 vs 2.25, ratio 9).
+// Used when hue-anchor mode is on: assigns pixels to the palette colour they
+// share a HUE with, even when the lightness differs a lot. This is what makes
+// scattered bright-cyan flecks read as the same "role colour" as the big
+// cyan mirror panels.
+function nearestPaletteLabHueWeighted(lab, palette) {
+  let best = 0, bestD = Infinity;
+  for (let i = 0; i < palette.length; i++) {
+    const dl = (lab[0] - palette[i][0]) * 0.5;
+    const da = (lab[1] - palette[i][1]) * 1.5;
+    const db = (lab[2] - palette[i][2]) * 1.5;
     const d = dl*dl + da*da + db*db;
     if (d < bestD) { bestD = d; best = i; }
   }
@@ -655,6 +778,176 @@ function removeSmallRegions(indexMap, W, H, minSize) {
   }
 
   return out;
+}
+
+// ─── Spatial-aware palette merge ────────────────────────────────────────────
+// Idea: two palette colours that are perceptually similar AND never (or
+// rarely) touch each other in the image can be merged without visual loss —
+// the eye reads them as the same colour anyway, because no boundary forces
+// you to compare them side-by-side. This is more aggressive than the global
+// perceptual-only merge: it can collapse pairs the painter would otherwise
+// see as distinct, as long as they're spatially separated.
+//
+// Input: indexMap (mutable copy made internally), labPalette (LAB centroids),
+//        frozenCount (first N palette entries are reserved highlights/shadows).
+// Output: { indexMap, labPalette } with merges applied and palette compacted.
+//
+// Greedy iterative: each pass finds the best merge candidate (most-mergeable
+// pair), applies it, then re-evaluates. Stops when no candidate qualifies.
+function spatialMergePalette(indexMap, W, H, labPalette, frozenCount, minK) {
+  // Tunables — picked to bias toward useful merges without collapsing distinct
+  // colours like brown-vs-green even when they don't touch.
+  const DIST_THRESHOLD       = 25;   // Hue-weighted LAB — looser than the global merge.
+  const ADJACENCY_FRACTION   = 0.05; // <5% shared perimeter = "spatially separated".
+  const HARD_DIST_THRESHOLD  = 14;   // Below this, merge regardless of adjacency.
+
+  // Weighted LAB distance (same weights as global merge — lightness counts
+  // half, chroma 1.5x — for "painter would mix the same paint").
+  const W_L = 0.5, W_C = 1.5;
+  function dist(a, b) {
+    const dL = (a[0] - b[0]) * W_L;
+    const da = (a[1] - b[1]) * W_C;
+    const db = (a[2] - b[2]) * W_C;
+    return Math.sqrt(dL*dL + da*da + db*db);
+  }
+
+  // Mutable working copies — we never want to mutate the caller's data.
+  let palette = labPalette.map(c => c.slice());
+  let map = new Uint8Array(indexMap);
+  let frozen = palette.map((_, i) => i < frozenCount);
+
+  // A merge collapses entry `from` → entry `to`. After applying, indices above
+  // `from` shift down by one. We don't compact mid-loop (expensive); we just
+  // track which entries are still alive via the `alive` array.
+  const alive = palette.map(() => true);
+  const aliveCount = () => alive.reduce((n, v) => n + (v ? 1 : 0), 0);
+
+  // Build helpers we'll need every iteration: per-colour pixel counts, and
+  // per-colour-pair boundary counts. Both derived from `map`.
+  function tallySizesAndBoundaries() {
+    const N = palette.length;
+    const sizes = new Uint32Array(N);
+    // Boundaries: count of pixels of colour A whose 4-neighbour is colour B.
+    // Each boundary pixel-pair contributes twice (once from each side), which
+    // is fine — symmetry preserved when we average for "shared perimeter".
+    const boundaries = Array.from({length: N}, () => new Uint32Array(N));
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        const c = map[i];
+        if (c === 255) continue;
+        sizes[c]++;
+        // Only check right and down — each pair counted from both sides
+        // would still be symmetric if we did all 4; we'd just have to
+        // divide by 2 later. Doing 2 here is cheaper.
+        if (x + 1 < W) {
+          const n = map[i + 1];
+          if (n !== 255 && n !== c) {
+            boundaries[c][n]++;
+            boundaries[n][c]++;
+          }
+        }
+        if (y + 1 < H) {
+          const n = map[i + W];
+          if (n !== 255 && n !== c) {
+            boundaries[c][n]++;
+            boundaries[n][c]++;
+          }
+        }
+      }
+    }
+    // Per-colour perimeter ≈ sum of boundaries to all other colours.
+    const perims = new Uint32Array(N);
+    for (let i = 0; i < N; i++) {
+      let s = 0;
+      for (let j = 0; j < N; j++) s += boundaries[i][j];
+      perims[i] = s;
+    }
+    return { sizes, boundaries, perims };
+  }
+
+  // Find the single best merge candidate. Returns null if nothing qualifies.
+  // "Best" = lowest perceptual distance among pairs that satisfy the
+  // adjacency rule. Ties broken by lower adjacency.
+  function findMerge(sizes, boundaries, perims) {
+    let best = null;
+    const N = palette.length;
+    for (let i = 0; i < N; i++) {
+      if (!alive[i]) continue;
+      for (let j = i + 1; j < N; j++) {
+        if (!alive[j]) continue;
+        if (frozen[i] && frozen[j]) continue;
+        const d = dist(palette[i], palette[j]);
+        // Adjacency fraction: shared boundary / min perimeter of the two.
+        // Using min (rather than sum) means even a tiny colour that's only
+        // adjacent to one other large colour reads as "highly adjacent".
+        const minPerim = Math.min(perims[i], perims[j]) || 1;
+        const adj = boundaries[i][j] / minPerim;
+
+        const qualifies =
+          d < HARD_DIST_THRESHOLD ||                       // Very similar — always merge.
+          (d < DIST_THRESHOLD && adj < ADJACENCY_FRACTION); // Similar AND separated.
+
+        if (!qualifies) continue;
+        // Pick the lowest-distance pair as the best.
+        if (!best || d < best.d || (d === best.d && adj < best.adj)) {
+          best = { i, j, d, adj };
+        }
+      }
+    }
+    return best;
+  }
+
+  // Apply a merge: pick which entry survives (the larger by pixel count, or
+  // the frozen one if one is frozen), then rewrite map and disable the absorbed.
+  function applyMerge(merge, sizes) {
+    let survivor, absorbed;
+    if (frozen[merge.i]) { survivor = merge.i; absorbed = merge.j; }
+    else if (frozen[merge.j]) { survivor = merge.j; absorbed = merge.i; }
+    else if (sizes[merge.i] >= sizes[merge.j]) { survivor = merge.i; absorbed = merge.j; }
+    else { survivor = merge.j; absorbed = merge.i; }
+
+    // If the survivor is frozen, the position stays put. Otherwise, weighted
+    // average so the colour shifts slightly toward the absorbed minority.
+    if (!frozen[survivor]) {
+      const wS = sizes[survivor], wA = sizes[absorbed];
+      const wTot = wS + wA || 1;
+      palette[survivor] = [
+        (palette[survivor][0] * wS + palette[absorbed][0] * wA) / wTot,
+        (palette[survivor][1] * wS + palette[absorbed][1] * wA) / wTot,
+        (palette[survivor][2] * wS + palette[absorbed][2] * wA) / wTot,
+      ];
+    }
+    alive[absorbed] = false;
+    // Repaint every pixel of the absorbed colour to the survivor.
+    for (let i = 0; i < map.length; i++) {
+      if (map[i] === absorbed) map[i] = survivor;
+    }
+  }
+
+  // Main loop — bounded iteration count for safety.
+  for (let iter = 0; iter < 50 && aliveCount() > minK; iter++) {
+    const { sizes, boundaries, perims } = tallySizesAndBoundaries();
+    const merge = findMerge(sizes, boundaries, perims);
+    if (!merge) break;
+    applyMerge(merge, sizes);
+  }
+
+  // Compact: build a new palette of alive entries (frozen first) and remap
+  // indexMap to the new contiguous indices.
+  const remap = new Uint8Array(palette.length);
+  const newPalette = [];
+  for (let i = 0; i < palette.length; i++) {
+    if (alive[i] && frozen[i]) { remap[i] = newPalette.length; newPalette.push(palette[i]); }
+  }
+  for (let i = 0; i < palette.length; i++) {
+    if (alive[i] && !frozen[i]) { remap[i] = newPalette.length; newPalette.push(palette[i]); }
+  }
+  for (let i = 0; i < map.length; i++) {
+    if (map[i] !== 255) map[i] = remap[map[i]];
+  }
+
+  return { indexMap: map, labPalette: newPalette };
 }
 
 // ─── Outline drawing ─────────────────────────────────────────────────────────
