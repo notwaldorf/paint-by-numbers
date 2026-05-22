@@ -179,10 +179,9 @@ header span {
 
 .smooth-label {
   font-family: 'Playfair Display', serif;
-  font-style: italic;
-  font-size: 0.9rem;
-  font-weight: 400;
-  min-width: 5ch;
+  font-size: 1.6rem;
+  font-weight: 700;
+  min-width: 3ch;
   text-align: right;
   color: var(--accent);
 }

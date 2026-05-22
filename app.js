@@ -74,9 +74,8 @@ colourSlider.addEventListener('input', () => {
   colourCountEl.textContent = colourSlider.value;
 });
 
-const smoothLabels = ['None', 'Light', 'Medium', 'Heavy'];
 smoothSlider.addEventListener('input', () => {
-  smoothLabelEl.textContent = smoothLabels[parseInt(smoothSlider.value)];
+  smoothLabelEl.textContent = smoothSlider.value;
 });
 
 // ─── Generate ────────────────────────────────────────────────────────────────
@@ -173,11 +172,19 @@ async function runPaintByNumbers() {
   workCanvas.height = H;
   wctx.drawImage(sourceImage, 0, 0, W, H);
 
-  const smoothLevel = parseInt(smoothSlider.value); // 0 = none, 1 = light, 2 = medium, 3 = heavy
+  // Slider is 0-100, user-facing. Map to internal continuous intensity (0-4).
+  // 75 corresponds to the old "Heavy" preset; 100 gives some headroom beyond.
+  const smoothValue = parseInt(smoothSlider.value);
+  const intensity = smoothValue / 25;
+  // Mode-filter is a discrete pass count — too many passes hurts. Map
+  // intensity to 0-3 passes via thresholds at 0.5 / 1.5 / 2.5.
+  const modePasses = intensity < 0.5 ? 0 :
+                     intensity < 1.5 ? 1 :
+                     intensity < 2.5 ? 2 : 3;
 
-  // Pre-blur the source proportional to image size & smoothing level
-  if (smoothLevel > 0) {
-    const blurRadius = Math.max(1, Math.round(Math.min(W, H) / 400)) * smoothLevel;
+  // Pre-blur the source proportional to image size & smoothing intensity
+  if (intensity > 0) {
+    const blurRadius = Math.max(1, Math.round(Math.min(W, H) / 400) * intensity);
     wctx.filter = `blur(${blurRadius}px)`;
     wctx.drawImage(sourceImage, 0, 0, W, H);
     wctx.filter = 'none';
@@ -196,17 +203,17 @@ async function runPaintByNumbers() {
   }
 
   // Step 4: Clean up noise — mode filter + small-region removal
-  if (smoothLevel > 0) {
+  if (intensity > 0) {
     setProgress(null, 'Simplifying regions…');
     await delay(30);
 
-    // Apply mode filter (majority vote) — passes = smoothLevel
-    for (let pass = 0; pass < smoothLevel; pass++) {
+    // Apply mode filter (majority vote)
+    for (let pass = 0; pass < modePasses; pass++) {
       indexMap = modeFilter(indexMap, W, H);
     }
 
-    // Remove tiny regions — threshold scales with image size and smoothing
-    const minRegionSize = Math.max(8, Math.round((W * H) / 2000)) * smoothLevel;
+    // Remove tiny regions — threshold scales with image size and intensity
+    const minRegionSize = Math.max(8, Math.round((W * H) / 2000) * intensity);
     indexMap = removeSmallRegions(indexMap, W, H, minRegionSize);
   }
 
