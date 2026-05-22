@@ -126,16 +126,22 @@ async function runPaintByNumbers() {
   wctx.drawImage(sourceImage, 0, 0, sw, sh);
   const smallData = wctx.getImageData(0, 0, sw, sh).data;
 
-  const pixels = [];
+  // Collect sample pixels as LAB (perceptual space — k-means in LAB
+  // produces palettes that match how the eye sees colour differences,
+  // rather than RGB which over-weights green channel changes).
+  const labPixels = [];
   for (let i = 0; i < smallData.length; i += 4) {
     if (smallData[i+3] < 128) continue;
-    pixels.push([smallData[i], smallData[i+1], smallData[i+2]]);
+    labPixels.push(rgbToLab(smallData[i], smallData[i+1], smallData[i+2]));
   }
 
-  // Step 2: K-means
+  // Step 2: K-means in LAB, with extremes reserved
   setProgress(null, 'Running k-means…');
   await delay(30);
-  const palette = await kMeans(pixels, k);
+  const labPalette = await kMeansLab(labPixels, k);
+
+  // Convert LAB palette → RGB for rendering, palette UI and downloads.
+  const palette = labPalette.map(c => labToRgb(c[0], c[1], c[2]));
 
   // Step 3: Quantise full-res image (with optional pre-blur to reduce noise)
   setProgress(null, 'Quantising image…');
@@ -161,7 +167,8 @@ async function runPaintByNumbers() {
   let indexMap = new Uint8Array(W * H);
   for (let i = 0; i < W * H; i++) {
     if (fullData[i*4 + 3] < 128) { indexMap[i] = 255; continue; }
-    indexMap[i] = nearestPalette(fullData[i*4], fullData[i*4+1], fullData[i*4+2], palette);
+    const lab = rgbToLab(fullData[i*4], fullData[i*4+1], fullData[i*4+2]);
+    indexMap[i] = nearestPaletteLab(lab, labPalette);
   }
 
   // Step 4: Clean up noise — mode filter + small-region removal
@@ -254,27 +261,61 @@ function redrawOutput() {
   if (optNumbers.checked)              drawNumbers(ctx, indexMap, W, H, palette.length, painted);
 }
 
-// ─── K-means (k-means++ init, chunked iteration) ─────────────────────────────
-function kMeans(pixels, k) {
+// ─── K-means in LAB, with extremes reserved ─────────────────────────────────
+// Operates entirely in LAB so distances are perceptual. The brightest and
+// darkest pixels (by L*) get their own dedicated, FROZEN centroids — they
+// are assigned during the E-step but never updated during the M-step. This
+// guarantees the palette preserves true highlights and shadows instead of
+// letting k-means drag them toward the colour mass.
+function kMeansLab(pixels, k) {
   return new Promise(resolve => {
-    // k-means++ initialisation
-    const centroids = [pixels[Math.floor(Math.random() * pixels.length)].slice()];
-    while (centroids.length < k) {
-      const dists = pixels.map(p => {
-        let minD = Infinity;
-        for (const c of centroids) {
-          const d = colorDistSq(p, c);
-          if (d < minD) minD = d;
+    // Decide how many centroids to reserve for extremes.
+    // For very small palettes (k <= 3), reserve none — we can't spare them.
+    // For k >= 4, reserve 1 bright + 1 dark = 2 frozen centroids.
+    const reserveExtremes = k >= 4;
+    const frozenCount = reserveExtremes ? 2 : 0;
+    const movingCount = k - frozenCount;
+
+    const frozen = [];
+    if (reserveExtremes) {
+      // Sample brightest ~0.5% and darkest ~0.5% by L*, then average each
+      // group to a single centroid. Averaging (rather than picking one pixel)
+      // gives a stable representative even if there's noise.
+      const sorted = pixels.slice().sort((a, b) => a[0] - b[0]);
+      const pct = Math.max(1, Math.floor(sorted.length * 0.005));
+      frozen.push(averageLab(sorted.slice(0, pct)));            // darkest
+      frozen.push(averageLab(sorted.slice(sorted.length - pct))); // brightest
+    }
+
+    // k-means++ init for the moving centroids, biased AWAY from the frozen
+    // ones (so we don't waste a moving centroid right next to a frozen one).
+    const moving = [];
+    if (movingCount > 0) {
+      moving.push(pixels[Math.floor(Math.random() * pixels.length)].slice());
+      while (moving.length < movingCount) {
+        const dists = pixels.map(p => {
+          let minD = Infinity;
+          for (const c of moving) {
+            const d = labDistSq(p, c);
+            if (d < minD) minD = d;
+          }
+          for (const c of frozen) {
+            const d = labDistSq(p, c);
+            if (d < minD) minD = d;
+          }
+          return minD;
+        });
+        const total = dists.reduce((a, b) => a + b, 0);
+        let r = Math.random() * total;
+        for (let i = 0; i < dists.length; i++) {
+          r -= dists[i];
+          if (r <= 0) { moving.push(pixels[i].slice()); break; }
         }
-        return minD;
-      });
-      const total = dists.reduce((a, b) => a + b, 0);
-      let r = Math.random() * total;
-      for (let i = 0; i < dists.length; i++) {
-        r -= dists[i];
-        if (r <= 0) { centroids.push(pixels[i].slice()); break; }
       }
     }
+
+    // All centroids in one array: frozen first, then moving.
+    const centroids = [...frozen, ...moving];
 
     const maxIter = 30;
     const sample = pixels.length > 5000 ? sampleArray(pixels, 5000) : pixels;
@@ -288,20 +329,23 @@ function kMeans(pixels, k) {
 
       const sums = Array.from({length: k}, () => [0, 0, 0, 0]);
       for (const p of sample) {
-        const ni = nearestPalette(p[0], p[1], p[2], centroids);
+        const ni = nearestPaletteLab(p, centroids);
         sums[ni][0] += p[0];
         sums[ni][1] += p[1];
         sums[ni][2] += p[2];
         sums[ni][3]++;
       }
 
-      for (let i = 0; i < k; i++) {
+      // Update only the moving centroids; frozen ones stay put.
+      for (let i = frozenCount; i < k; i++) {
         if (sums[i][3] === 0) continue;
-        const nr = Math.round(sums[i][0] / sums[i][3]);
-        const ng = Math.round(sums[i][1] / sums[i][3]);
-        const nb = Math.round(sums[i][2] / sums[i][3]);
-        if (nr !== centroids[i][0] || ng !== centroids[i][1] || nb !== centroids[i][2]) changed = true;
-        centroids[i] = [nr, ng, nb];
+        const nl = sums[i][0] / sums[i][3];
+        const na = sums[i][1] / sums[i][3];
+        const nb = sums[i][2] / sums[i][3];
+        if (Math.abs(nl - centroids[i][0]) > 0.1 ||
+            Math.abs(na - centroids[i][1]) > 0.1 ||
+            Math.abs(nb - centroids[i][2]) > 0.1) changed = true;
+        centroids[i] = [nl, na, nb];
       }
 
       setTimeout(step, 0);
@@ -310,17 +354,73 @@ function kMeans(pixels, k) {
   });
 }
 
-function colorDistSq(a, b) {
+function averageLab(arr) {
+  let l = 0, a = 0, b = 0;
+  for (const p of arr) { l += p[0]; a += p[1]; b += p[2]; }
+  return [l / arr.length, a / arr.length, b / arr.length];
+}
+
+function labDistSq(a, b) {
   return (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2;
 }
 
-function nearestPalette(r, g, b, palette) {
+function nearestPaletteLab(lab, palette) {
   let best = 0, bestD = Infinity;
   for (let i = 0; i < palette.length; i++) {
-    const d = (r-palette[i][0])**2 + (g-palette[i][1])**2 + (b-palette[i][2])**2;
+    const dl = lab[0] - palette[i][0];
+    const da = lab[1] - palette[i][1];
+    const db = lab[2] - palette[i][2];
+    const d = dl*dl + da*da + db*db;
     if (d < bestD) { bestD = d; best = i; }
   }
   return best;
+}
+
+// ─── sRGB ↔ CIE L*a*b* conversion ───────────────────────────────────────────
+// Goes via linear sRGB → XYZ (D65) → LAB. L* is roughly [0, 100],
+// a* and b* roughly [-128, 127].
+function rgbToLab(r, g, b) {
+  // sRGB → linear
+  let R = r / 255, G = g / 255, B = b / 255;
+  R = R > 0.04045 ? Math.pow((R + 0.055) / 1.055, 2.4) : R / 12.92;
+  G = G > 0.04045 ? Math.pow((G + 0.055) / 1.055, 2.4) : G / 12.92;
+  B = B > 0.04045 ? Math.pow((B + 0.055) / 1.055, 2.4) : B / 12.92;
+  // linear → XYZ (D65)
+  let X = R * 0.4124564 + G * 0.3575761 + B * 0.1804375;
+  let Y = R * 0.2126729 + G * 0.7151522 + B * 0.0721750;
+  let Z = R * 0.0193339 + G * 0.1191920 + B * 0.9503041;
+  // Normalise by D65 reference white
+  X /= 0.95047; Y /= 1.00000; Z /= 1.08883;
+  // XYZ → LAB
+  const f = t => t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16 / 116);
+  const fx = f(X), fy = f(Y), fz = f(Z);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+function labToRgb(L, a, b) {
+  // LAB → XYZ
+  const fy = (L + 16) / 116;
+  const fx = a / 500 + fy;
+  const fz = fy - b / 200;
+  const finv = t => {
+    const t3 = t * t * t;
+    return t3 > 0.008856 ? t3 : (t - 16 / 116) / 7.787;
+  };
+  let X = finv(fx) * 0.95047;
+  let Y = finv(fy) * 1.00000;
+  let Z = finv(fz) * 1.08883;
+  // XYZ → linear sRGB
+  let R = X *  3.2404542 + Y * -1.5371385 + Z * -0.4985314;
+  let G = X * -0.9692660 + Y *  1.8760108 + Z *  0.0415560;
+  let B = X *  0.0556434 + Y * -0.2040259 + Z *  1.0572252;
+  // linear → sRGB
+  const enc = c => c > 0.0031308 ? 1.055 * Math.pow(c, 1 / 2.4) - 0.055 : 12.92 * c;
+  R = enc(R); G = enc(G); B = enc(B);
+  return [
+    Math.max(0, Math.min(255, Math.round(R * 255))),
+    Math.max(0, Math.min(255, Math.round(G * 255))),
+    Math.max(0, Math.min(255, Math.round(B * 255))),
+  ];
 }
 
 function sampleArray(arr, n) {
