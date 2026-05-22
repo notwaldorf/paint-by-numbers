@@ -138,7 +138,18 @@ async function runPaintByNumbers() {
   // Step 2: K-means in LAB, with extremes reserved
   setProgress(null, 'Running k-means…');
   await delay(30);
-  const labPalette = await kMeansLab(labPixels, k);
+  const { centroids: rawCentroids, sizes, frozenCount } = await kMeansLab(labPixels, k);
+
+  // Step 2b: Merge perceptually-near-duplicate centroids. K-means happily
+  // produces several greens within a few ΔE of each other in leafy images;
+  // for someone actually painting this, they'd mix the same paint. So we
+  // collapse them. The slider value becomes a MAX, not an exact count.
+  const MERGE_THRESHOLD = 15;   // Hue-weighted LAB distance — "painter same".
+  const MIN_K = Math.max(4, Math.ceil(k / 3));
+  const labPalette = mergeNearbyCentroids(rawCentroids, sizes, frozenCount, MERGE_THRESHOLD, MIN_K);
+  if (labPalette.length < rawCentroids.length) {
+    console.log(`Merged ${rawCentroids.length} → ${labPalette.length} palette entries`);
+  }
 
   // Convert LAB palette → RGB for rendering, palette UI and downloads.
   const palette = labPalette.map(c => labToRgb(c[0], c[1], c[2]));
@@ -321,9 +332,15 @@ function kMeansLab(pixels, k) {
     const sample = pixels.length > 5000 ? sampleArray(pixels, 5000) : pixels;
     let changed = true;
     let iter = 0;
+    // Track the most recent assignment counts so we can return them.
+    // These are computed every iteration in `sums[i][3]`; we just snapshot.
+    let lastSizes = new Array(k).fill(0);
 
     function step() {
-      if (!changed || iter >= maxIter) { resolve(centroids); return; }
+      if (!changed || iter >= maxIter) {
+        resolve({ centroids, sizes: lastSizes, frozenCount });
+        return;
+      }
       changed = false;
       iter++;
 
@@ -348,6 +365,9 @@ function kMeansLab(pixels, k) {
         centroids[i] = [nl, na, nb];
       }
 
+      // Snapshot sizes for the resolve case.
+      for (let i = 0; i < k; i++) lastSizes[i] = sums[i][3];
+
       setTimeout(step, 0);
     }
     setTimeout(step, 0);
@@ -358,6 +378,94 @@ function averageLab(arr) {
   let l = 0, a = 0, b = 0;
   for (const p of arr) { l += p[0]; a += p[1]; b += p[2]; }
   return [l / arr.length, a / arr.length, b / arr.length];
+}
+
+// ─── Merge near-duplicate palette entries ────────────────────────────────────
+// After k-means converges we often end up with several centroids that are
+// perceptually almost identical (especially in image regions dominated by one
+// hue — like a tree canopy with many subtly-different greens). For a painter
+// they're indistinguishable, so we collapse them.
+//
+// Agglomerative: repeatedly find the closest pair in LAB, merge them by
+// pixel-count-weighted average, stop when the closest pair exceeds the
+// threshold or we hit a minimum-size floor.
+//
+// Distance is HUE-WEIGHTED (chroma weighted higher than lightness): a painter
+// distinguishes brown from green more readily than dark-grey from black, so we
+// down-weight pure lightness differences when deciding what's a "duplicate".
+//
+// Frozen extremes (highlights/shadows) can absorb neighbours but never move —
+// the result of "frozen + moving" merge keeps the frozen colour. This protects
+// the highlight/shadow reservation from being undone by the merge step.
+function mergeNearbyCentroids(centroids, sizes, frozenCount, threshold, minK) {
+  // Hue-weighted LAB distance: lightness counts half, chroma 1.5x.
+  // Squared form to avoid sqrt in the hot loop; threshold squared accordingly.
+  const W_L = 0.5, W_C = 1.5;
+  function paintDistSq(a, b) {
+    const dL = (a[0] - b[0]) * W_L;
+    const da = (a[1] - b[1]) * W_C;
+    const db = (a[2] - b[2]) * W_C;
+    return dL*dL + da*da + db*db;
+  }
+  const thresholdSq = threshold * threshold;
+
+  // Work on copies. `alive[i]` is false once a centroid has been absorbed.
+  const c = centroids.map(x => x.slice());
+  const s = sizes.slice();
+  const isFrozen = c.map((_, i) => i < frozenCount);
+  const alive = c.map(() => true);
+
+  const aliveCount = () => alive.reduce((n, v) => n + (v ? 1 : 0), 0);
+
+  while (aliveCount() > minK) {
+    // Find the closest pair of alive centroids (in weighted-paint distance).
+    let bestD = Infinity, bestI = -1, bestJ = -1;
+    for (let i = 0; i < c.length; i++) {
+      if (!alive[i]) continue;
+      for (let j = i + 1; j < c.length; j++) {
+        if (!alive[j]) continue;
+        // Skip pairs of two frozen — they're our reserved extremes.
+        if (isFrozen[i] && isFrozen[j]) continue;
+        const d = paintDistSq(c[i], c[j]);
+        if (d < bestD) { bestD = d; bestI = i; bestJ = j; }
+      }
+    }
+    if (bestI === -1) break;
+    if (bestD >= thresholdSq) break; // Closest pair is already distinct enough.
+
+    // Decide which one survives and where the merged point lands.
+    // - One frozen, one moving: the frozen absorbs the moving; position stays.
+    // - Two moving: weighted average by size, larger one absorbs smaller.
+    if (isFrozen[bestI] || isFrozen[bestJ]) {
+      const frozenIdx = isFrozen[bestI] ? bestI : bestJ;
+      const otherIdx  = isFrozen[bestI] ? bestJ : bestI;
+      s[frozenIdx] += s[otherIdx];
+      alive[otherIdx] = false;
+      // c[frozenIdx] unchanged — frozen position is canonical.
+    } else {
+      // Weighted merge: bigger cluster pulls more weight, so the dominant
+      // colour stays put and the minor near-duplicate gets folded in.
+      const wI = s[bestI], wJ = s[bestJ];
+      const wTot = wI + wJ || 1;
+      const survivor = wI >= wJ ? bestI : bestJ;
+      const absorbed = wI >= wJ ? bestJ : bestI;
+      c[survivor] = [
+        (c[bestI][0] * wI + c[bestJ][0] * wJ) / wTot,
+        (c[bestI][1] * wI + c[bestJ][1] * wJ) / wTot,
+        (c[bestI][2] * wI + c[bestJ][2] * wJ) / wTot,
+      ];
+      s[survivor] = wTot;
+      alive[absorbed] = false;
+    }
+  }
+
+  // Compact: keep only the alive centroids, frozen ones first (so their index
+  // stays at the start — keeps the rendering's "frozenCount" assumption valid,
+  // though nothing downstream actually depends on it).
+  const result = [];
+  for (let i = 0; i < c.length; i++) if (alive[i] && isFrozen[i]) result.push(c[i]);
+  for (let i = 0; i < c.length; i++) if (alive[i] && !isFrozen[i]) result.push(c[i]);
+  return result;
 }
 
 function labDistSq(a, b) {
