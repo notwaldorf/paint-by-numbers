@@ -4,6 +4,7 @@ let currentPalette = [];
 let currentIndexMap = null; // Uint8Array: palette index per pixel (255 = transparent)
 let currentWidth = 0;
 let currentHeight = 0;
+let highlightedIndex = -1;  // -1 = none, otherwise palette index to highlight in blank view
 
 // ─── DOM refs ───────────────────────────────────────────────────────────────
 const uploadZone    = document.getElementById('uploadZone');
@@ -61,6 +62,7 @@ function loadFile(file) {
     paletteSection.style.display = 'none';
     emptyState.style.display = 'flex';
     currentIndexMap = null;
+    highlightedIndex = -1;
   };
   img.src = url;
 }
@@ -89,6 +91,11 @@ optNumbers.addEventListener('change', () => {
   if (currentIndexMap) redrawOutput();
 });
 previewToggle.addEventListener('change', () => {
+  // Manually flipping the painted/blank pill clears any colour highlight.
+  if (highlightedIndex !== -1) {
+    highlightedIndex = -1;
+    updatePaletteSelectionUI();
+  }
   if (currentIndexMap) redrawOutput();
 });
 
@@ -100,6 +107,7 @@ async function runPaintByNumbers() {
   toolbar.style.display = 'none';
   paletteSection.style.display = 'none';
   progressWrap.style.display = 'block';
+  highlightedIndex = -1;
 
   const k = parseInt(colourSlider.value);
 
@@ -203,13 +211,16 @@ function redrawOutput() {
   const H = currentHeight;
   const palette = currentPalette;
   const indexMap = currentIndexMap;
-  const painted = previewToggle.checked;
+  // Highlight mode overrides the painted/blank toggle: it's blank + one colour.
+  const highlighting = highlightedIndex >= 0;
+  const painted = highlighting ? false : previewToggle.checked;
 
   outputCanvas.width = W;
   outputCanvas.height = H;
   const ctx = outputCanvas.getContext('2d');
 
-  // Base fill — either palette colours (painted) or white (blank template)
+  // Base fill — either palette colours (painted) or white (blank template).
+  // In highlight mode: white everywhere except the highlighted colour's regions.
   const imgData = ctx.createImageData(W, H);
   const d = imgData.data;
 
@@ -220,7 +231,14 @@ function redrawOutput() {
       d[i*4] = 255; d[i*4+1] = 255; d[i*4+2] = 255; d[i*4+3] = 0;
       continue;
     }
-    if (painted) {
+    if (highlighting) {
+      if (pi === highlightedIndex) {
+        const c = palette[pi];
+        d[i*4] = c[0]; d[i*4+1] = c[1]; d[i*4+2] = c[2];
+      } else {
+        d[i*4] = 255; d[i*4+1] = 255; d[i*4+2] = 255;
+      }
+    } else if (painted) {
       const c = palette[pi];
       d[i*4] = c[0]; d[i*4+1] = c[1]; d[i*4+2] = c[2];
     } else {
@@ -230,7 +248,8 @@ function redrawOutput() {
   }
   ctx.putImageData(imgData, 0, 0);
 
-  // Overlays — outlines only shown in blank mode (painted preview stays clean)
+  // Overlays — outlines shown in blank mode and in highlight mode
+  // (so the user can see the regions to fill in).
   if (optOutlines.checked && !painted) drawOutlines(ctx, indexMap, W, H, painted);
   if (optNumbers.checked)              drawNumbers(ctx, indexMap, W, H, palette.length, painted);
 }
@@ -526,6 +545,7 @@ function renderPalette(palette) {
     const hex = rgbToHex(c[0], c[1], c[2]);
     const entry = document.createElement('div');
     entry.className = 'palette-entry';
+    entry.dataset.index = i;
     entry.style.animationDelay = `${i * 40}ms`;
     entry.innerHTML = `
       <div class="swatch" style="background:${hex}"></div>
@@ -533,9 +553,28 @@ function renderPalette(palette) {
       <span>${hex}</span>
       <span class="palette-hex">rgb(${c[0]},${c[1]},${c[2]})</span>
     `;
+    entry.addEventListener('click', () => togglePaletteHighlight(i));
     paletteList.appendChild(entry);
   });
   paletteSection.style.display = 'block';
+  updatePaletteSelectionUI();
+}
+
+// Toggle highlight: clicking the active colour clears it, clicking another switches.
+function togglePaletteHighlight(i) {
+  highlightedIndex = (highlightedIndex === i) ? -1 : i;
+  updatePaletteSelectionUI();
+  redrawOutput();
+}
+
+// Apply 'selected' / 'dimmed' classes to palette entries based on highlightedIndex.
+function updatePaletteSelectionUI() {
+  const entries = paletteList.querySelectorAll('.palette-entry');
+  entries.forEach(el => {
+    const idx = parseInt(el.dataset.index);
+    el.classList.toggle('selected', idx === highlightedIndex);
+    el.classList.toggle('dimmed', highlightedIndex >= 0 && idx !== highlightedIndex);
+  });
 }
 
 // ─── Progress helper ─────────────────────────────────────────────────────────
@@ -553,7 +592,9 @@ function setProgress(pct, label) {
 // ─── Download ────────────────────────────────────────────────────────────────
 downloadBtn.addEventListener('click', () => {
   const a = document.createElement('a');
-  const mode = previewToggle.checked ? 'painted' : 'blank';
+  let mode;
+  if (highlightedIndex >= 0) mode = `colour-${highlightedIndex + 1}`;
+  else mode = previewToggle.checked ? 'painted' : 'blank';
   a.download = `paint-by-numbers-${mode}.png`;
   a.href = outputCanvas.toDataURL('image/png');
   a.click();
