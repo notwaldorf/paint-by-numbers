@@ -100,6 +100,25 @@ previewToggle.addEventListener('change', () => {
   if (currentIndexMap) redrawOutput();
 });
 
+// ─── Click-to-isolate on the output canvas ───────────────────────────────────
+// Clicking a region in the rendered image isolates that region's colour, the
+// same way clicking the palette swatch does. Translates the click from CSS
+// pixels (the canvas is styled max-width: 100%) into the canvas's internal
+// pixel grid, then looks up the palette index for that pixel.
+outputCanvas.addEventListener('click', e => {
+  if (!currentIndexMap) return;
+  const rect = outputCanvas.getBoundingClientRect();
+  // Guard against zero-size rect (e.g. canvas not laid out yet).
+  if (rect.width === 0 || rect.height === 0) return;
+  const x = Math.floor((e.clientX - rect.left) * (currentWidth  / rect.width));
+  const y = Math.floor((e.clientY - rect.top)  * (currentHeight / rect.height));
+  if (x < 0 || y < 0 || x >= currentWidth || y >= currentHeight) return;
+  const pi = currentIndexMap[y * currentWidth + x];
+  // Ignore transparent pixels (sentinel 255) — no colour to isolate.
+  if (pi === 255) return;
+  togglePaletteHighlight(pi);
+});
+
 // ─── Core algorithm ─────────────────────────────────────────────────────────
 async function runPaintByNumbers() {
   generateBtn.disabled = true;

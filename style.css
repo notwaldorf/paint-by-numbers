@@ -337,6 +337,7 @@ header span {
   border: 2px solid var(--ink);
   box-shadow: 6px 6px 0 var(--shadow);
   image-rendering: pixelated;
+  cursor: pointer;
 }
 
 /* Toolbar above the canvas */
