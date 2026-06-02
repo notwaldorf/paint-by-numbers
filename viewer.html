@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paint by Numbers — Region Viewer</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* Viewer-specific tweaks layered on top of the main stylesheet */
+  .viewer-canvas-area {
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.5rem;
+    min-height: 0;
+    overflow: auto;
+  }
+  .viewer-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    width: 100%;
+    max-width: 900px;
+  }
+  .viewer-toolbar .hint {
+    font-size: 0.65rem;
+    opacity: 0.55;
+    margin: 0;
+  }
+  .viewer-toolbar-spacer { flex: 1; }
+
+  #viewerCanvas {
+    display: block;
+    max-width: 100%;
+    border: 2px solid var(--ink);
+    box-shadow: 6px 6px 0 var(--shadow);
+    image-rendering: pixelated;
+    cursor: crosshair;
+    z-index:100;
+  }
+  #viewerCanvas.no-image { cursor: default; }
+
+  .tolerance-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+  .tolerance-row input[type=range] {
+    width: 110px;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 3px;
+    background: var(--ink);
+    outline: none;
+    cursor: pointer;
+  }
+  .tolerance-row input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px; height: 14px;
+    background: var(--accent);
+    border: 2px solid var(--ink);
+    cursor: pointer;
+    border-radius: 0;
+  }
+  .tolerance-row input[type=range]::-moz-range-thumb {
+    width: 14px; height: 14px;
+    background: var(--accent);
+    border: 2px solid var(--ink);
+    cursor: pointer;
+    border-radius: 0;
+  }
+  .tolerance-value {
+    font-family: 'Playfair Display', serif;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 2ch;
+    font-size: 1rem;
+  }
+
+  .nav-links {
+    margin-left: auto;
+  }
+
+  .viewer-upload {
+    max-width: 480px;
+    width: 100%;
+    margin: auto;
+  }
+  .viewer-upload .section-label {
+    font-size: 0.6rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    opacity: 0.45;
+    margin-bottom: 0.5rem;
+  }
+
+  .swatch-readout {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    opacity: 0.85;
+  }
+  .swatch-readout .swatch {
+    width: 22px; height: 22px;
+    border: 2px solid var(--ink);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Region <em>Viewer</em></h1>
+  <div class="nav-links">
+    <a href="index.html">Generate</a>
+    <a href="viewer.html" class="active">Viewer</a>
+  </div>
+</header>
+
+<main class="viewer-canvas-area">
+
+  <!-- Upload state -->
+  <div class="viewer-upload" id="uploadState">
+    <div class="section-label">Load a paint-by-numbers image</div>
+    <div class="upload-zone" id="uploadZone">
+      <input type="file" id="fileInput" accept="image/*">
+      <span class="upload-icon">🖼</span>
+      <p><strong>Click or drag</strong> an image here<br>JPG, PNG, GIF, WebP</p>
+    </div>
+    <p class="hint" style="margin-top:1rem">
+      Click anywhere on the loaded image to isolate that region's colour.
+      Click the same region again, or press <kbd>Esc</kbd>, to clear.
+    </p>
+  </div>
+
+  <!-- Toolbar (shown after upload) -->
+  <div class="viewer-toolbar" id="viewerToolbar" style="display:none">
+    <button class="btn-sm" id="newImageBtn">↑ New image</button>
+
+    <div class="tolerance-row" title="How tolerant the region-fill is to small colour variation (anti-aliased edges, JPEG noise).">
+      <span>Tolerance</span>
+      <input type="range" id="toleranceSlider" min="0" max="60" value="12" step="1">
+      <span class="tolerance-value" id="toleranceValue">12</span>
+    </div>
+
+    <div class="swatch-readout" id="swatchReadout" style="display:none">
+      <span>Isolated</span>
+      <span class="swatch" id="swatchColour"></span>
+      <span id="swatchHex"></span>
+    </div>
+
+    <div class="viewer-toolbar-spacer"></div>
+
+    <button class="btn-sm" id="clearBtn" style="display:none">✕ Clear</button>
+    <button class="btn-sm" id="downloadBtn" style="display:none">↓ Download PNG</button>
+  </div>
+
+  <!-- Canvas -->
+  <canvas id="viewerCanvas" class="no-image" style="display:none"></canvas>
+
+</main>
+
+<script src="viewer.js"></script>
+</body>
+</html>

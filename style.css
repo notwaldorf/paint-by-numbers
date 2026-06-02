@@ -68,6 +68,26 @@ header span {
   padding-bottom: 0.3em;
 }
 
+/* Top-right nav linking the generate page and the viewer page */
+.nav-links {
+  margin-left: auto;
+  display: flex;
+  gap: 1.25rem;
+  font-size: 0.65rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.nav-links a {
+  color: var(--ink);
+  text-decoration: none;
+  opacity: 0.55;
+  border-bottom: 1px solid transparent;
+  padding-bottom: 2px;
+  transition: opacity 0.15s, border-color 0.15s;
+}
+.nav-links a:hover { opacity: 1; border-bottom-color: var(--accent); }
+.nav-links a.active { opacity: 1; border-bottom-color: var(--ink); }
+
 .layout {
   position: relative;
   z-index: 1;
